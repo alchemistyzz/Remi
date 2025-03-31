@@ -262,8 +262,7 @@ def main():
                         help="是否使用VLLM加速")
     args = parser.parse_args()
 
-    print("开始准备数据...")
-    prompts, labels = prepare_data()
+    
     
     if args.use_vllm:
         print("初始化VLLM加速的模型...")
@@ -273,7 +272,8 @@ def main():
         print("初始化标准Qwen模型...")
         model, processor = init_qwen_model(args.model_path)
         inference_func = lambda prompt: qwen_multimodal_call(prompt, model, processor)
-    
+    print("开始准备数据...")
+    prompts, labels = prepare_data()
     print("开始模型推理...")
     model_responses = {}
     for task in prompts:
