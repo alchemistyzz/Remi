@@ -5,15 +5,13 @@
 import io
 import json
 import os
-import vertexai
-from vertexai.preview.generative_models import GenerativeModel, Part, Image
+import requests
+from base64 import b64encode
 from datasets import load_dataset
 from tqdm import tqdm
-import torch
 from PIL import Image as PILImage
 import argparse
-from vllm import LLM, SamplingParams
-from transformers import AutoProcessor
+import math
 
 # 工具函数
 def pil_image_to_bytes(img, format='PNG'):
@@ -24,25 +22,12 @@ def pil_image_to_bytes(img, format='PNG'):
   return img_byte_arr.getvalue()
 
 def get_multi_image_question_parts(record, question_appendix, max_num_images=6):
-  """Converts the question into multiple parts corresponding to texts/images.
-
-  Args:
-    record: This is a dictionary with a key "question" containing the text of
-            the question, and multiple keys named "image_i" corresponding to
-            the i-th image.
-    question_appendix: A text to be appended at the end of the question.
-    max_num_images: Maximum number of images in a problem (6 for ReMI).
-
-  Returns:
-    A list of vertexai parts where each part is either a piece of text or an
-    image.
-  """
-
+  """处理包含多个图像的问题"""
   parts, images = [], []
   for i in range(max_num_images):
-    img_bytes = pil_image_to_bytes(record[f'image_{i+1}'])
-    if img_bytes:
-      images.append(Part.from_data(img_bytes, mime_type='image/png'))
+    img_key = f'image_{i+1}'
+    if img_key in record and record[img_key] is not None:
+      images.append(record[img_key])
 
   question = 'Question: ' + record['question'] + question_appendix
   for j, img in enumerate(images):
@@ -53,7 +38,7 @@ def get_multi_image_question_parts(record, question_appendix, max_num_images=6):
 
 # 评估函数
 def strip_json(s):
-  """Takes a text possibly containing a json, and extrcts the json part."""
+  """提取文本中的JSON部分"""
   return s[s.index('{') if '{' in s else 0: s.rindex('}') + 1 if '}' in s else 0]
 
 def is_float(x):
@@ -120,6 +105,8 @@ QUESTION_APPENDICES = {
 
 # 准备数据
 def prepare_data():
+    """加载ReMI数据集并准备评估数据"""
+    print("开始加载ReMI数据集...")
     prompts, labels = {}, {}
     for example in tqdm(load_dataset("mehrankazemi/ReMI")['test']):
         task = example['task']
@@ -127,137 +114,92 @@ def prepare_data():
         labels[task] = labels.get(task, []) + [example['label']]
     return prompts, labels
 
-# 初始化Qwen模型 (标准模式)
-def init_qwen_model(model_path=None):
-    from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
-    import torch
+# 图像预处理：确保不超过最大像素限制
+def preprocess_image(img, max_pixels=2048*28*28):
+    """预处理图像，确保不超过最大像素限制"""
+    width, height = img.size
+    pixels = width * height
     
-    model_id = model_path if model_path else "Qwen/Qwen2.5-VL-7B-Instruct"
-    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True, max_pixels=2048*28*28)
-    print(f"加载模型：{model_id}")
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        model_id,
-        device_map="auto",
-        trust_remote_code=True,
-        torch_dtype=torch.float16
-    )
-    return model, processor
+    if pixels <= max_pixels:
+        return img  # 不需要调整尺寸
+    
+    # 计算需要的缩放比例
+    scale_factor = math.sqrt(max_pixels / pixels)
+    new_width = int(width * scale_factor)
+    new_height = int(height * scale_factor)
+    
+    # 调整图像大小
+    resized_img = img.resize((new_width, new_height), PILImage.LANCZOS)
+    print(f"调整图像尺寸: {width}x{height} -> {new_width}x{new_height}")
+    
+    return resized_img
 
-# 保存并处理图像
-def save_and_process_images(prompt_parts, image_dir="./temp_images"):
-    """将图像保存到临时目录并准备消息格式"""
+# 保存并编码图像
+def process_images_for_api(image_parts, image_dir="./temp_images", max_pixels=2048*28*28):
+    """将图像保存到临时文件并编码为Base64格式"""
     os.makedirs(image_dir, exist_ok=True)
     
-    messages = [{"role": "user", "content": []}]
+    image_data = []
     image_paths = []
     
-    for i, part in enumerate(prompt_parts):
-        if isinstance(part, str):
-            messages[0]["content"].append({"type": "text", "text": part})
-        else:  # 这是一个图像Part
-            img_bytes = part.inline_data.data
-            img = PILImage.open(io.BytesIO(img_bytes))
-            
-            # 保存图像到临时目录
-            image_path = f"{image_dir}/image_{i}.png"
-            img.save(image_path)
-            image_paths.append(image_path)
-            
-            messages[0]["content"].append({"type": "image_url", "image_url": {"url": f"file://{image_path}"}})
+    for i, img in enumerate(image_parts):
+        # 预处理图像
+        preprocessed_img = preprocess_image(img, max_pixels)
+        
+        # 保存图像到临时目录
+        image_path = f"{image_dir}/image_{i}.png"
+        preprocessed_img.save(image_path)
+        image_paths.append(image_path)
+        
+        # 将图像编码为Base64
+        with open(image_path, 'rb') as img_file:
+            encoded_image = b64encode(img_file.read()).decode('utf-8')
+            image_data.append({
+                "data": encoded_image,
+                "id": f"image_{i}"
+            })
     
-    return messages, image_paths
+    return image_data, image_paths
 
-# 初始化VLLM模型
-def init_vllm_model(model_path=None):
-    model_id = model_path if model_path else "Qwen/Qwen2.5-VL-7B-Instruct"
-    print(f"加载VLLM模型：{model_id}")
-    
-    # VLLM环境变量设置
-    os.environ["VLLM_USE_MODELSCOPE"] = "True"
-    os.environ["VLLM_TRUST_REMOTE_CODE"] = "True"
-    
-    # 初始化VLLM模型
-    model = LLM(
-        model=model_id,
-        dtype="half",  # 使用FP16
-        gpu_memory_utilization=0.85,  # 控制GPU内存使用率
-        trust_remote_code=True,
-        enforce_eager=True,  # 强制使用eager模式
-        max_model_len=4096,  # 设置最大长度
-    )
-    
-    # 加载处理器用于图像处理
-    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-    
-    return model, processor
-
-# Qwen模型推理函数 (标准模式)
-def qwen_multimodal_call(prompt_parts, qwen_model, qwen_processor):
-    """对Qwen模型进行调用"""
-    # 解析prompt_parts为Qwen接受的格式
-    messages = [{"role": "user", "content": []}]
-    
-    for part in prompt_parts:
-        if isinstance(part, str):
-            messages[0]["content"].append({"type": "text", "text": part})
-        else:  # 这是一个图像Part
-            img_bytes = part.inline_data.data
-            img = PILImage.open(io.BytesIO(img_bytes))
-            messages[0]["content"].append({"type": "image", "image": img})
-    
-    # 构建Qwen模型的输入
-    text = qwen_processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    
-    image_inputs = [content["image"] for content in messages[0]["content"] 
-                   if content.get("type") == "image"]
-    
-    inputs = qwen_processor(
-        text=[text],
-        images=image_inputs,
-        padding=True,
-        return_tensors="pt"
-    )
-    
-    inputs = inputs.to(qwen_model.device)
-    
-    # 生成回复
-    with torch.no_grad():  # 禁用梯度计算以节省内存
-        generated_ids = qwen_model.generate(**inputs, max_new_tokens=512)
-        generated_ids_trimmed = [
-            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-        ]
-    
-    output_text = qwen_processor.batch_decode(
-        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-    )[0]
-    
-    torch.cuda.empty_cache()  # 清理缓存
-    return output_text
-
-# VLLM模型推理函数 (修改版)
-def vllm_multimodal_call(prompt_parts, vllm_model, processor):
-    """使用VLLM模型进行推理"""
+# 通过API调用VLLM服务
+def call_vllm_api(prompt_parts, api_url="http://localhost:8000/v1/completions", model_name="Qwen/Qwen2.5-VL-7B-Instruct", max_pixels=2048*28*28):
+    """通过API调用VLLM服务"""
     try:
-        # 先处理图像并保存到临时目录
-        messages, image_paths = save_and_process_images(prompt_parts)
+        # 分离文本和图像部分
+        text_parts = []
+        image_parts = []
         
-        # 构建模型的输入
-        text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        for part in prompt_parts:
+            if isinstance(part, str):
+                text_parts.append(part)
+            else:  # 图像
+                image_parts.append(part)
         
-        # VLLM采样参数
-        sampling_params = SamplingParams(
-            temperature=0.0,  # 使用贪婪解码
-            max_tokens=512,
-            stop=None
-        )
+        # 处理图像
+        image_dir = "./temp_images"
+        image_data, image_paths = process_images_for_api(image_parts, image_dir, max_pixels)
         
-        # 使用VLLM生成回复
-        outputs = vllm_model.generate([text], sampling_params)
-        output_text = outputs[0].outputs[0].text
+        # 构建完整的提示文本
+        prompt_text = " ".join(text_parts)
+        for i in range(len(image_data)):
+            prompt_text = prompt_text.replace(f"<image{i+1}>", f"<img src=\"data:image/png;base64,{image_data[i]['data']}\">")
+        
+        # 构建API请求
+        payload = {
+            "model": model_name,
+            "prompt": prompt_text,
+            "temperature": 0.0,  # 贪婪解码
+            "max_tokens": 512,
+            "stop": None
+        }
+        
+        # 发送请求到VLLM服务
+        response = requests.post(api_url, json=payload, timeout=60)
+        response.raise_for_status()  # 确保请求成功
+        
+        # 解析响应
+        result = response.json()
+        output_text = result["choices"][0]["text"]
         
         # 清理临时图像文件
         for path in image_paths:
@@ -266,22 +208,28 @@ def vllm_multimodal_call(prompt_parts, vllm_model, processor):
                 
         return output_text
     except Exception as e:
-        print(f"VLLM推理错误：{e}")
+        print(f"VLLM API调用错误: {type(e).__name__}: {e}")
         # 如果失败，返回一个空JSON以避免整个评估失败
         return '{"explanation": "处理错误", "answer": "BAD_JSON"}'
 
 # 主函数
 def main():
-    parser = argparse.ArgumentParser(description="VLLM加速的Qwen模型ReMI评估")
-    parser.add_argument('--model_path', type=str, default="Qwen/Qwen2.5-VL-7B-Instruct",
-                        help="模型路径，可以根据需要修改")
-    parser.add_argument('--use_vllm', action='store_true', default=True,
-                        help="是否使用VLLM加速")
+    parser = argparse.ArgumentParser(description="通过VLLM服务评估Qwen模型在ReMI数据集上的表现")
+    parser.add_argument('--api_url', type=str, default="http://localhost:8000/v1/completions",
+                        help="VLLM服务的API URL")
+    parser.add_argument('--model_name', type=str, default="Qwen/Qwen2.5-VL-7B-Instruct",
+                        help="模型名称，用于API请求")
+    parser.add_argument('--max_pixels', type=int, default=2048*28*28,
+                        help="图像最大像素数量")
     parser.add_argument('--task', type=str, default=None,
                         help="指定要评估的单个任务，默认评估所有任务")
     args = parser.parse_args()
 
-    print("开始准备数据...")
+    print(f"VLLM服务地址: {args.api_url}")
+    print(f"模型名称: {args.model_name}")
+    print(f"图像最大像素数: {args.max_pixels}")
+    
+    # 准备数据
     prompts, labels = prepare_data()
     
     # 如果指定了特定任务，则只评估该任务
@@ -293,28 +241,20 @@ def main():
     else:
         selected_tasks = list(prompts.keys())
     
-    if args.use_vllm:
-        print("初始化VLLM加速的模型...")
-        model, processor = init_vllm_model(args.model_path)
-        inference_func = lambda prompt: vllm_multimodal_call(prompt, model, processor)
-    else:
-        print("初始化标准Qwen模型...")
-        model, processor = init_qwen_model(args.model_path)
-        inference_func = lambda prompt: qwen_multimodal_call(prompt, model, processor)
-    
     print("开始模型推理...")
     model_responses = {}
     for task in selected_tasks:
+        print(f"\n评估任务: {task}")
         model_responses[task] = []
         for prompt in tqdm(prompts[task], desc=f"处理任务: {task}"):
             try:
-                model_response = inference_func(prompt)
+                model_response = call_vllm_api(prompt, args.api_url, args.model_name, args.max_pixels)
                 model_responses[task].append(model_response)
             except Exception as e:
                 print(f"处理样本时出错: {e}")
                 model_responses[task].append('{"explanation": "处理错误", "answer": "BAD_JSON"}')
     
-    print("开始评估...")
+    print("\n开始评估...")
     task_scores = {}
     for task in model_responses:
         if not model_responses[task]:
@@ -323,21 +263,21 @@ def main():
             
         score = evaluate(task, labels[task], model_responses[task])
         task_scores[task] = score
-        print(f"{task}: {score:.2f}")
+        print(f"{task}: {score:.4f}")
 
     # 计算总体平均分
     if task_scores:
         average_score = sum(task_scores.values()) / len(task_scores)
         print("\n" + "="*50)
-        print(f"ReMI 总分: {average_score:.2f}")
+        print(f"ReMI 总分: {average_score:.4f}")
         print("="*50)
-        print(f"模型路径: {args.model_path}")
-        print(f"使用VLLM加速: {'是' if args.use_vllm else '否'}")
+        print(f"模型名称: {args.model_name}")
+        print(f"VLLM服务地址: {args.api_url}")
         
         # 以表格形式展示所有分数
         print("\n详细任务分数:")
         for task, score in sorted(task_scores.items(), key=lambda x: x[0]):
-            print(f"{task:<15}: {score:.2f}")
+            print(f"{task:<15}: {score:.4f}")
     else:
         print("没有可用的评估结果")
 
