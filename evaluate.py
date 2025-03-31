@@ -224,7 +224,7 @@ def main():
     print("\n" + "="*50)
     print(f"ReMI 总分: {average_score:.2f}")
     print("="*50)
-
+    print(f"模型路径: {model_path}")
     # 以表格形式展示所有分数
     print("\n详细任务分数:")
     for task, score in task_scores.items():
