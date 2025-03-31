@@ -12,6 +12,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 import torch
 from PIL import Image as PILImage
+import argparse
 
 # 工具函数
 def pil_image_to_bytes(img, format='PNG'):
@@ -129,12 +130,13 @@ def prepare_data():
     return prompts, labels
 
 # 初始化Qwen模型
-def init_qwen_model():
+def init_qwen_model(model_path=None):
     from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
     import torch
     
-    model_id = "Qwen/Qwen2.5-VL-7B-Instruct"
+    model_id = model_path if model_path else "Qwen/Qwen2.5-VL-7B-Instruct"
     processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True, max_pixels=2048*28*28)
+    print(f"加载模型：{model_id}")
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_id,
         device_map="auto",
@@ -190,11 +192,17 @@ def qwen_multimodal_call(prompt_parts, qwen_model, qwen_processor):
 
 # 主函数
 def main():
+    parser = argparse.ArgumentParser(description="Qwen模型推理")
+    parser.add_argument('--model_path', type=str, default="Qwen/Qwen2.5-VL-7B-Instruct",
+                        help="模型路径，可以根据需要修改")
+    args = parser.parse_args()
+
     print("开始准备数据...")
     prompts, labels = prepare_data()
     
     print("初始化Qwen模型...")
-    qwen_model, qwen_processor = init_qwen_model()
+    model_path = args.model_path  # 使用传入的模型路径
+    qwen_model, qwen_processor = init_qwen_model(model_path)
     
     print("开始模型推理...")
     model_responses = {}
