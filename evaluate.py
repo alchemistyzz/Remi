@@ -136,6 +136,7 @@ def init_qwen_model(model_path=None):
     
     model_id = model_path if model_path else "Qwen/Qwen2.5-VL-7B-Instruct"
     processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True, max_pixels=2048*28*28)
+    # processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
     print(f"加载模型：{model_id}")
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_id,
@@ -187,7 +188,7 @@ def qwen_multimodal_call(prompt_parts, qwen_model, qwen_processor):
         generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )[0]
     
-    torch.cuda.empty_cache()  # 清理缓存
+    # torch.cuda.empty_cache()  # 清理缓存
     return output_text
 
 # 主函数
