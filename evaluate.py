@@ -92,16 +92,31 @@ def prep_label(label):
 
 def evaluate(task, labels, model_responses):
   correct = 0
-  for orig_label, model_response in zip(labels, model_responses):
+  for i, (orig_label, model_response) in enumerate(zip(labels, model_responses)):
     pred, label = get_pred(model_response), prep_label(orig_label)
+    
+    # 打印详细信息
+    print(f"\n=== 样本 {i+1} ===")
+    print(f"模型原始输出:\n{model_response}")
+    print(f"解析后的预测值: {pred}")
+    print(f"实际标签: {label}")
+    
+    is_correct = False
     if task == 'RefCoco':
-      correct += 1 if str(pred) in label.split(',') else 0  # whether pred is in label
+      is_correct = str(pred) in label.split(',')
+      correct += 1 if is_correct else 0
     elif task in ['GeomShape', 'GeomCost']:
-      correct += 1 if relaxed_accuracy(label, pred, eps=0.03) else 0
+      is_correct = relaxed_accuracy(label, pred, eps=0.03)
+      correct += 1 if is_correct else 0
     elif task == 'Clocks':
-      correct += 1 if accuracy_with_tolerance(label, pred, tolerance=10) else 0
+      is_correct = accuracy_with_tolerance(label, pred, tolerance=10)
+      correct += 1 if is_correct else 0
     else:
-      correct += 1 if exact_match(label, pred) else 0
+      is_correct = exact_match(label, pred)
+      correct += 1 if is_correct else 0
+    
+    print(f"正确: {'✓' if is_correct else '✗'}")
+  
   return correct / len(labels)
 
 # 准备问题附加信息
