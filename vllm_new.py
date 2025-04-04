@@ -12,6 +12,10 @@ from tqdm import tqdm
 from PIL import Image as PILImage
 import argparse
 import math
+import openai
+from tqdm.asyncio import tqdm_asyncio
+
+import asyncio
 
 # 工具函数
 def pil_image_to_bytes(img, format='PNG'):
@@ -160,126 +164,124 @@ def process_images_for_api(image_parts, image_dir="./temp_images", max_pixels=20
             })
     
     return image_data, image_paths
+import base64
+from io import BytesIO
+from PIL import Image
+def read_img_as_base64(img):
+    if isinstance(img, str):
+        pil_img = Image.open(img)
+    else:
+        pil_img = img
+    buffered = BytesIO()
+    format = "PNG" if pil_img.mode in ("RGBA", "LA") else "JPEG"
+    pil_img.save(buffered, format=format)
+    return f"data:image/{format.lower()};base64,{base64.b64encode(buffered.getvalue()).decode('utf-8')}"
 
-# 通过API调用VLLM服务
-def call_vllm_api(prompt_parts, api_url="http://localhost:8000/v1/completions", model_name="Qwen/Qwen2.5-VL-7B-Instruct", max_pixels=2048*28*28):
-    """通过API调用VLLM服务"""
-    try:
-        # 分离文本和图像部分
-        text_parts = []
-        image_parts = []
-        
-        for part in prompt_parts:
-            if isinstance(part, str):
-                text_parts.append(part)
-            else:  # 图像
-                image_parts.append(part)
-        
-        # 处理图像
-        image_dir = "./temp_images"
-        image_data, image_paths = process_images_for_api(image_parts, image_dir, max_pixels)
-        
-        # 构建完整的提示文本
-        prompt_text = " ".join(text_parts)
-        for i in range(len(image_data)):
-            prompt_text = prompt_text.replace(f"<image{i+1}>", f"<img src=\"data:image/png;base64,{image_data[i]['data']}\">")
-        
-        # 构建API请求
-        payload = {
-            "model": model_name,
-            "prompt": prompt_text,
-            "temperature": 0.0,  # 贪婪解码
-            "max_tokens": 512,
-            "stop": None
-        }
-        
-        # 发送请求到VLLM服务
-        response = requests.post(api_url, json=payload, timeout=60)
-        response.raise_for_status()  # 确保请求成功
-        
-        # 解析响应
-        result = response.json()
-        output_text = result["choices"][0]["text"]
-        
-        # 清理临时图像文件
-        for path in image_paths:
-            if os.path.exists(path):
-                os.remove(path)
-                
-        return output_text
-    except Exception as e:
-        print(f"VLLM API调用错误: {type(e).__name__}: {e}")
-        # 如果失败，返回一个空JSON以避免整个评估失败
-        return '{"explanation": "处理错误", "answer": "BAD_JSON"}'
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
+import logging
+logger = logging.getLogger(__name__)
+@retry(
+    stop=stop_after_attempt(10),  # 最大重试次数
+    wait=wait_exponential(multiplier=1, min=1, max=128),  # 指数退避 (1, 2, 4, 8, ..., 128)
+    retry=(retry_if_exception_type(Exception)),  # 对所有异常重试
+    before_sleep=before_sleep_log(logger, logging.WARNING),  # 重试前记录日志
+    reraise=True  # 重试结束后重新抛出异常
+)
+async def get_model_response(prompt_parts, client, model):
+	messages = [{"role": "user", 'content': []}]
+	for part in prompt_parts:
+		if isinstance(part, str):
+			messages[0]['content'].append({"type": "text", "text": part})
+		else:
+			messages[0]['content'].append({"type": "image_url", "image_url": {"url": read_img_as_base64(part)}})
+	completion = await client.chat.completions.create(
+			model=model,
+			messages=messages,
+			temperature=0.0,
+			max_tokens=512,
+			stream=False,
+		)
+	return completion.choices[0].message.content
 
 # 主函数
-def main():
-    parser = argparse.ArgumentParser(description="通过VLLM服务评估Qwen模型在ReMI数据集上的表现")
-    parser.add_argument('--api_url', type=str, default="http://localhost:8000/v1/completions",
-                        help="VLLM服务的API URL")
-    parser.add_argument('--model_name', type=str, default="Qwen/Qwen2.5-VL-7B-Instruct",
-                        help="模型名称，用于API请求")
-    parser.add_argument('--max_pixels', type=int, default=2048*28*28,
-                        help="图像最大像素数量")
-    parser.add_argument('--task', type=str, default=None,
-                        help="指定要评估的单个任务，默认评估所有任务")
-    args = parser.parse_args()
+async def main():
+	parser = argparse.ArgumentParser(description="通过VLLM服务评估Qwen模型在ReMI数据集上的表现")
+	parser.add_argument('--api_url', type=str, default="http://localhost:8000/v1",
+						help="VLLM服务的API URL")
+	parser.add_argument('--model_name', type=str, default="Qwen/Qwen2.5-VL-7B-Instruct",
+						help="模型名称，用于API请求")
+	parser.add_argument('--max_pixels', type=int, default=2048*28*28,
+						help="图像最大像素数量")
+	parser.add_argument('--task', type=str, default=None,
+						help="指定要评估的单个任务，默认评估所有任务")
+	args = parser.parse_args()
 
-    print(f"VLLM服务地址: {args.api_url}")
-    print(f"模型名称: {args.model_name}")
-    print(f"图像最大像素数: {args.max_pixels}")
-    
-    # 准备数据
-    prompts, labels = prepare_data()
-    
-    # 如果指定了特定任务，则只评估该任务
-    if args.task:
-        if args.task not in prompts:
-            print(f"错误：找不到任务 '{args.task}'。可用任务: {list(prompts.keys())}")
-            return
-        selected_tasks = [args.task]
-    else:
-        selected_tasks = list(prompts.keys())
-    
-    print("开始模型推理...")
-    model_responses = {}
-    for task in selected_tasks:
-        print(f"\n评估任务: {task}")
-        model_responses[task] = []
-        for prompt in tqdm(prompts[task], desc=f"处理任务: {task}"):
-            try:
-                model_response = call_vllm_api(prompt, args.api_url, args.model_name, args.max_pixels)
-                model_responses[task].append(model_response)
-            except Exception as e:
-                print(f"处理样本时出错: {e}")
-                model_responses[task].append('{"explanation": "处理错误", "answer": "BAD_JSON"}')
-    
-    print("\n开始评估...")
-    task_scores = {}
-    for task in model_responses:
-        if not model_responses[task]:
-            print(f"警告: 任务 {task} 没有响应")
-            continue
-            
-        score = evaluate(task, labels[task], model_responses[task])
-        task_scores[task] = score
-        print(f"{task}: {score:.4f}")
+	print(f"VLLM服务地址: {args.api_url}")
+	print(f"模型名称: {args.model_name}")
+	print(f"图像最大像素数: {args.max_pixels}")
+	openai_api_key = "EMPTY"
+	openai_api_base = args.api_url
+	client = openai.AsyncOpenAI(
+		api_key=openai_api_key,
+		base_url=openai_api_base,
+	)
+	model = args.model_name
+		
+	# 准备数据
+	prompts, labels = prepare_data()
 
-    # 计算总体平均分
-    if task_scores:
-        average_score = sum(task_scores.values()) / len(task_scores)
-        print("\n" + "="*50)
-        print(f"ReMI 总分: {average_score:.4f}")
-        print("="*50)
-        print(f"模型名称: {args.model_name}")
-        print(f"VLLM服务地址: {args.api_url}")
-        
-        # 以表格形式展示所有分数
-        print("\n详细任务分数:")
-        for task, score in sorted(task_scores.items(), key=lambda x: x[0]):
-            print(f"{task:<15}: {score:.4f}")
-    else:
-        print("没有可用的评估结果")
+	# 如果指定了特定任务，则只评估该任务
+	if args.task:
+		if args.task not in prompts:
+			print(f"错误：找不到任务 '{args.task}'。可用任务: {list(prompts.keys())}")
+			return
+		selected_tasks = [args.task]
+	else:
+		selected_tasks = list(prompts.keys())
+
+	print("开始模型推理...")
+	model_responses = {}
+	for task in selected_tasks:
+		print(f"\n评估任务: {task}")
+		model_responses[task] = []
+		async_tasks = []
+		for prompt in tqdm(prompts[task], desc=f"处理任务: {task}"):
+			async_tasks.append(asyncio.create_task(get_model_response(prompt, client, model)))
+		results = await tqdm_asyncio.gather(*async_tasks)
+		model_responses[task].extend(results)
+			# try:
+			#     model_response = get_model_response(prompt, client, model)
+			#     model_responses[task].append(model_response)
+			# except Exception as e:
+			#     print(f"处理样本时出错: {e}")
+			#     model_responses[task].append('{"explanation": "处理错误", "answer": "BAD_JSON"}')
+
+	print("\n开始评估...")
+	task_scores = {}
+	for task in model_responses:
+		if not model_responses[task]:
+			print(f"警告: 任务 {task} 没有响应")
+			continue
+			
+		score = evaluate(task, labels[task], model_responses[task])
+		task_scores[task] = score
+		print(f"{task}: {score:.4f}")
+
+	# 计算总体平均分
+	if task_scores:
+		average_score = sum(task_scores.values()) / len(task_scores)
+		print("\n" + "="*50)
+		print(f"ReMI 总分: {average_score:.4f}")
+		print("="*50)
+		print(f"模型名称: {args.model_name}")
+		print(f"VLLM服务地址: {args.api_url}")
+		
+		# 以表格形式展示所有分数
+		print("\n详细任务分数:")
+		for task, score in sorted(task_scores.items(), key=lambda x: x[0]):
+			print(f"{task:<15}: {score:.4f}")
+	else:
+		print("没有可用的评估结果")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
