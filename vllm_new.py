@@ -68,12 +68,12 @@ def accuracy_with_tolerance(label, pred, tolerance=10):
 	return float(label) - tolerance <= float(pred) <= float(label) + tolerance
 
 def get_pred(model_response):
-	model_response_json = strip_json(model_response).replace('\\"', '').replace('\\', '')
+	model_response_json = strip_json(model_response).replace('\\"', '').replace('\\', '').replace('\n', ' ').replace('\r', '')
 	try:
 		pred = str(json.loads(model_response_json)['answer']).lower()
 		return pred.split('%')[0].strip()
 	except (KeyError, json.JSONDecodeError):
-		logger.warning(f'json parse error: {model_response}')
+		logger.warning(f'json parse error: {model_response_json}')
 		return 'BAD_JSON'
 
 def prep_label(label):
@@ -203,7 +203,7 @@ async def get_model_response(prompt_parts, client, model):
 			model=model,
 			messages=messages,
 			temperature=0.0,
-			max_tokens=512,
+			max_tokens=1024,
 			stream=False,
 		)
 	logger.debug(f"Question: {text_question}\n Answer: {completion.choices[0].message.content}")
