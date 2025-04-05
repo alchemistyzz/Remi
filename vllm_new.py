@@ -73,7 +73,7 @@ def get_pred(model_response):
 		pred = str(json.loads(model_response_json)['answer']).lower()
 		return pred.split('%')[0].strip()
 	except (KeyError, json.JSONDecodeError):
-		logger.warning('json parse error: {model_response}')
+		logger.warning(f'json parse error: {model_response}')
 		return 'BAD_JSON'
 
 def prep_label(label):
