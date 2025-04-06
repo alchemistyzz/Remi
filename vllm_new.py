@@ -48,23 +48,50 @@ def strip_json(s):
 import re
 import json
 def extract_json(text):
-	# 定义正确的正则表达式模式
-	patterns = [
-		r"```json([\s\S]*?)```",
-		r"(\{([\s\S]*)\})",
-		r"(\{\s*\"explanation\"[\s\S]*\})"
-	]
+    """提取文本中的JSON部分。如果常规正则匹配和 json.loads 失败，则尝试使用 fallback 提取 'answer' 字段，若依然失败返回提取失败标记变量。"""
+    patterns = [
+        r"```json([\s\S]*?)```",
+        r"(\{([\s\S]*)\})",
+        r"(\{\s*\"explanation\"[\s\S]*\})"
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            json_str = match.group(1).strip().replace('\\"', '').replace('\\', '').replace('\n', '').replace('\r', '')
+            try:
+                return json.loads(json_str)
+            except Exception as e:
+                logger.warning(f"json load error using pattern {pattern}: {e}. Trying next pattern...")
+                continue  # 尝试下一个模式
+                
+    # Fallback 提取：直接查找 "answer": 后面的内容
+    fallback_match = re.search(r'"answer"\s*:\s*(".*?"|\d+)', text)
+    if fallback_match:
+        answer_str = fallback_match.group(1).strip('"')
+        logger.warning(f"Fallback extraction used. Extracted answer: {answer_str}")
+        return {"answer": answer_str}
+    
+    logger.warning(f"json parse error and fallback failed: {text}")
+    return "BAD_JSON"
+# def extract_json(text):
+# 	# 定义正确的正则表达式模式
+# 	patterns = [
+# 		r"```json([\s\S]*?)```",
+# 		r"(\{([\s\S]*)\})",
+# 		r"(\{\s*\"explanation\"[\s\S]*\})"
+# 	]
 	
-	for pattern in patterns:
-		match = re.search(pattern, text, re.DOTALL)
-		if match:
-			json_str = match.group(1).strip().replace('\\"', '').replace('\\', '').replace('\n', '').replace('\r', '') # 去除首尾空白字符
-			try:
-				return json.loads(json_str)
-			except:
-				continue  # 尝试下一个模式
-	logger.warning(f'json parse error: {text}')
-	return None
+# 	for pattern in patterns:
+# 		match = re.search(pattern, text, re.DOTALL)
+# 		if match:
+# 			json_str = match.group(1).strip().replace('\\"', '').replace('\\', '').replace('\n', '').replace('\r', '') # 去除首尾空白字符
+# 			try:
+# 				return json.loads(json_str)
+# 			except:
+# 				continue  # 尝试下一个模式
+# 	logger.warning(f'json parse error: {text}')
+# 	return None
 
 def is_float(x):
 	try: float(x); return True
@@ -87,16 +114,39 @@ def accuracy_with_tolerance(label, pred, tolerance=10):
 	if not is_float(label) or not is_float(pred): return False
 	return float(label) - tolerance <= float(pred) <= float(label) + tolerance
 
+# def get_pred(model_response):
+# 	# model_response_json = strip_json(model_response).replace('\\"', '').replace('\\', '').replace('\n', '').replace('\r', '')
+# 	model_response_json = extract_json(model_response)
+# 	try:
+# 		pred = str(model_response_json['answer']).lower()
+# 		return pred.split('%')[0].strip()
+# 	except Exception as e:
+# 		# log e
+# 		logger.warning(f"Error extracting answer: {e}")
+# 		return 'BAD_JSON'
 def get_pred(model_response):
-	# model_response_json = strip_json(model_response).replace('\\"', '').replace('\\', '').replace('\n', '').replace('\r', '')
-	model_response_json = extract_json(model_response)
-	try:
-		pred = str(model_response_json['answer']).lower()
-		return pred.split('%')[0].strip()
-	except Exception as e:
-		# log e
-		logger.warning(f"Error extracting answer: {e}")
-		return 'BAD_JSON'
+    """
+    从模型响应中提取答案字段。
+    如果提取到的是标准 JSON 格式，则直接用 json.loads 提取 'answer'。
+    否则使用 fallback 方法清洗提取，并记录该条响应的 log。
+    """
+    model_response_json = extract_json(model_response)
+    try:
+        if isinstance(model_response_json, dict) and "answer" in model_response_json:
+            pred = str(model_response_json['answer']).lower()
+            return pred.split('%')[0].strip()
+        else:
+            raise ValueError("Extracted response is not a valid dict with 'answer' field")
+    except Exception as e:
+        logger.warning(f"Error extracting answer from valid json: {e}. Model response: {model_response}")
+        # fallback 清洗：直接使用正则查找 answer 字段
+        fallback_match = re.search(r'"answer"\s*:\s*(".*?"|\d+)', model_response)
+        if fallback_match:
+            answer_str = fallback_match.group(1).strip('"')
+            logger.warning(f"Fallback extraction in get_pred, extracted answer: {answer_str}")
+            return answer_str.lower().split('%')[0].strip()
+        return 'BAD_JSON'
+
 
 def prep_label(label):
 	return label.lower().replace('\\', '').split('%')[0].strip()
