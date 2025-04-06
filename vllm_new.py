@@ -45,6 +45,26 @@ def get_multi_image_question_parts(record, question_appendix, max_num_images=6):
 def strip_json(s):
 	"""提取文本中的JSON部分"""
 	return s[s.index('{') if '{' in s else 0: s.rindex('}') + 1 if '}' in s else 0]
+import re
+import json
+def extract_json(text):
+	# 定义正确的正则表达式模式
+	patterns = [
+		r"```json([\s\S]*?)```",
+		r"(\{([\s\S]*)\})",
+		r"(\{\s*\"explanation\"[\s\S]*\})"
+	]
+	
+	for pattern in patterns:
+		match = re.search(pattern, text, re.DOTALL)
+		if match:
+			json_str = match.group(1).strip().replace('\\"', '').replace('\\', '').replace('\n', '').replace('\r', '') # 去除首尾空白字符
+			try:
+				return json.loads(json_str)
+			except:
+				continue  # 尝试下一个模式
+	logger.warning(f'json parse error: {text}')
+	return None
 
 def is_float(x):
 	try: float(x); return True
@@ -68,12 +88,14 @@ def accuracy_with_tolerance(label, pred, tolerance=10):
 	return float(label) - tolerance <= float(pred) <= float(label) + tolerance
 
 def get_pred(model_response):
-	model_response_json = strip_json(model_response).replace('\\"', '').replace('\\', '').replace('\n', ' ').replace('\r', '')
+	# model_response_json = strip_json(model_response).replace('\\"', '').replace('\\', '').replace('\n', '').replace('\r', '')
+	model_response_json = extract_json(model_response)
 	try:
-		pred = str(json.loads(model_response_json)['answer']).lower()
+		pred = str(model_response_json['answer']).lower()
 		return pred.split('%')[0].strip()
-	except (KeyError, json.JSONDecodeError):
-		logger.warning(f'json parse error: {model_response_json}')
+	except Exception as e:
+		# log e
+		logger.warning(f"Error extracting answer: {e}")
 		return 'BAD_JSON'
 
 def prep_label(label):
